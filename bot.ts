@@ -14,7 +14,14 @@ import {
   RawAccount,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import {
+  Liquidity,
+  LiquidityPoolKeysV4,
+  LiquidityStateV4,
+  Percent,
+  Token,
+  TokenAmount,
+} from '@raydium-io/raydium-sdk';
 import { MarketCache, PoolCache, SnipeListCache } from './cache';
 import { PoolFilters } from './filters';
 import { TransactionExecutor } from './transactions';
@@ -27,6 +34,7 @@ import { TradeSignals } from './tradeSignals';
 import { Messaging } from './messaging';
 import { WhitelistCache } from './cache/whitelist.cache';
 import { TechnicalAnalysisCache } from './cache/technical-analysis.cache';
+import BN from 'bn.js'; // Aseguramos importar BN desde bn.js
 
 export interface BotConfig {
   wallet: Keypair;
@@ -45,7 +53,6 @@ export interface BotConfig {
   unitLimit: number;
   unitPrice: number;
   takeProfit: number;
-  stopLoss: number;
   trailingStopLoss: boolean;
   skipSellingIfLostMoreThan: number;
   buySlippage: number;
@@ -160,8 +167,6 @@ export class Bot {
       }
     }
 
-
-
     const numberOfActionsBeingProcessed =
       this.config.maxTokensAtTheTime - this.semaphore.getValue() + this.sellExecutionCount;
     if (this.semaphore.isLocked() || numberOfActionsBeingProcessed >= this.config.maxTokensAtTheTime) {
@@ -183,7 +188,6 @@ export class Bot {
 
       if (!whitelistSnipe) {
         if (!this.config.useSnipeList) {
-
           const match = await this.filterMatch(poolKeys);
 
           if (!match) {
@@ -205,7 +209,6 @@ export class Bot {
       const startTime = Date.now();
       for (let i = 0; i < this.config.maxBuyRetries; i++) {
         try {
-
           if ((Date.now() - startTime) > 10000) {
             logger.info(`Not buying mint ${poolState.baseMint.toString()}, max buy 10 sec timer exceeded!`);
             return;
@@ -226,6 +229,7 @@ export class Bot {
             this.config.buySlippage,
             this.config.wallet,
             'buy',
+            false // No incluir la instrucción de cerrar la cuenta en la compra
           );
 
           if (result.confirmed) {
@@ -268,20 +272,13 @@ export class Bot {
     try {
       const poolData = await this.poolStorage.get(rawAccount.mint.toString());
 
-      if (poolData && poolData.sold) {
+      if (!poolData || poolData.sold) {
         return;
       }
 
       logger.trace({ mint: rawAccount.mint }, `Processing new token...`);
 
-      if (!poolData) {
-        logger.trace({ mint: rawAccount.mint.toString() }, `Token pool data is not found, can't sell`);
-        return;
-      }
-
-
-      let moonshotConditionAmount = KEEP_5_PERCENT_FOR_MOONSHOTS ? (rawAccount.amount * BigInt(95)) / BigInt(100) : rawAccount.amount;
-
+      const moonshotConditionAmount = KEEP_5_PERCENT_FOR_MOONSHOTS ? (rawAccount.amount * BigInt(95)) / BigInt(100) : rawAccount.amount;
       const tokenIn = new Token(TOKEN_PROGRAM_ID, poolData.state.baseMint, poolData.state.baseDecimal.toNumber());
       const tokenAmountIn = new TokenAmount(tokenIn, moonshotConditionAmount, true);
 
@@ -290,26 +287,27 @@ export class Bot {
         return;
       }
 
+      const market = await this.marketStorage.get(poolData.state.marketId.toString());
+      const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(new PublicKey(poolData.id), poolData.state, market);
+
       if (this.config.autoSellDelay > 0) {
         logger.debug({ mint: rawAccount.mint }, `Waiting for ${this.config.autoSellDelay} ms before sell`);
         await sleep(this.config.autoSellDelay);
       }
 
-      const market = await this.marketStorage.get(poolData.state.marketId.toString());
-      const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(new PublicKey(poolData.id), poolData.state, market);
+      const shouldSell = await this.tradeSignals.waitForSellSignal(tokenAmountIn, poolKeys);
 
+      if (!shouldSell) {
+        logger.info({ mint: rawAccount.mint.toString() }, `Sell signal not met, skipping sell`);
+        return;
+      }
+
+      const startTime = Date.now();
       for (let i = 0; i < this.config.maxSellRetries; i++) {
         try {
-          if (i < 1) { // Only check for sell signal on first attempt, not on retries
-            const shouldSell = await this.tradeSignals.waitForSellSignal(tokenAmountIn, poolKeys);
-
-            if (!shouldSell) {
-              return;
-            }
-          }
-
-          if (KEEP_5_PERCENT_FOR_MOONSHOTS) { //only if you aim for the moon
-            this.poolStorage.markAsSold(rawAccount.mint.toString());
+          if ((Date.now() - startTime) > 10000) {
+            logger.info(`Not selling mint ${rawAccount.mint.toString()}, max sell 10 sec timer exceeded!`);
+            return;
           }
 
           logger.info(
@@ -327,52 +325,11 @@ export class Bot {
             this.config.sellSlippage,
             this.config.wallet,
             'sell',
+            true // Incluir la instrucción de cerrar la cuenta en la venta
           );
 
           if (result.confirmed) {
-
-            try {
-              this.connection.getParsedTransaction(result.signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 })
-                .then(async (parsedConfirmedTransaction) => {
-                  if (parsedConfirmedTransaction) {
-                    let preTokenBalances = parsedConfirmedTransaction.meta.preTokenBalances;
-                    let postTokenBalances = parsedConfirmedTransaction.meta.postTokenBalances;
-
-                    // Filter for WSOL mint and your public key
-                    let pre = preTokenBalances
-                      .filter(x => x.mint === this.config.quoteToken.mint.toString() && x.owner === this.config.wallet.publicKey.toString())
-                      .map(x => x.uiTokenAmount.uiAmount)
-                      .reduce((a, b) => a + b, 0); // Sum the pre values
-
-                    let post = postTokenBalances
-                      .filter(x => x.mint === this.config.quoteToken.mint.toString() && x.owner === this.config.wallet.publicKey.toString())
-                      .map(x => x.uiTokenAmount.uiAmount)
-                      .reduce((a, b) => a + b, 0); // Sum the post values
-
-                    let quoteAmountNumber = parseFloat(this.config.quoteAmount.toFixed());
-                    let profitOrLoss = (post - pre) - quoteAmountNumber;
-                    let percentageChange = (profitOrLoss / quoteAmountNumber) * 100
-
-                    await this.messaging.sendTelegramMessage(`⭕Confirmed sale at <b>${(post - pre).toFixed(5)}</b>⭕\n\n${profitOrLoss < 0 ? "🔴Loss " : "🟢Profit "}<code>${profitOrLoss.toFixed(5)} ${this.config.quoteToken.symbol} (${(percentageChange).toFixed(2)}%)</code>\n\nRetries <code>${i + 1}/${this.config.maxSellRetries}</code>`, rawAccount.mint.toString());
-                  }
-                })
-                .catch((error) => {
-                  console.log('Error fetching transaction details:', error);
-                });
-
-
-            } catch (error) {
-              console.log("Error calculating profit", error);
-            }
-            logger.info(
-              {
-                dex: `https://dexscreener.com/solana/${rawAccount.mint.toString()}?maker=${this.config.wallet.publicKey}`,
-                mint: rawAccount.mint.toString(),
-                signature: result.signature,
-                url: `https://solscan.io/tx/${result.signature}?cluster=${NETWORK}`,
-              },
-              `Confirmed sell tx`,
-            );
+            this.processSellTransactionResult(result, rawAccount, poolData, i);
             break;
           }
 
@@ -382,10 +339,10 @@ export class Bot {
               signature: result.signature,
               error: result.error,
             },
-            `Error confirming sell tx`,
+            `Error confirming sell tx on attempt ${i + 1}`
           );
         } catch (error) {
-          logger.debug({ mint: rawAccount.mint.toString(), error }, `Error confirming sell transaction`);
+          logger.debug({ mint: rawAccount.mint.toString(), error }, `Error confirming sell transaction on attempt ${i + 1}`);
         }
       }
     } catch (error) {
@@ -395,7 +352,60 @@ export class Bot {
     }
   }
 
-  // noinspection JSUnusedLocalSymbols
+  private async processSellTransactionResult(result: any, rawAccount: RawAccount, poolData: any, retryCount: number) {
+    try {
+      const parsedConfirmedTransaction = await this.connection.getParsedTransaction(result.signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+
+      if (parsedConfirmedTransaction) {
+        const preTokenBalances = parsedConfirmedTransaction.meta.preTokenBalances;
+        const postTokenBalances = parsedConfirmedTransaction.meta.postTokenBalances;
+
+        const pre = preTokenBalances
+          .filter(x => x.mint === this.config.quoteToken.mint.toString() && x.owner === this.config.wallet.publicKey.toString())
+          .map(x => x.uiTokenAmount.uiAmount)
+          .reduce((a, b) => a + b, 0);
+
+        const post = postTokenBalances
+          .filter(x => x.mint === this.config.quoteToken.mint.toString() && x.owner === this.config.wallet.publicKey.toString())
+          .map(x => x.uiTokenAmount.uiAmount)
+          .reduce((a, b) => a + b, 0);
+
+        const quoteAmountNumber = parseFloat(this.config.quoteAmount.toFixed());
+        const profitOrLoss = (post - pre) - quoteAmountNumber;
+        const percentageChange = (profitOrLoss / quoteAmountNumber) * 100;
+
+        await this.messaging.sendTelegramMessage(`⭕Confirmed sale at <b>${(post - pre).toFixed(5)}</b>⭕\n\n${profitOrLoss < 0 ? "🔴Loss " : "🟢Profit "}<code>${profitOrLoss.toFixed(5)} ${this.config.quoteToken.symbol} (${(percentageChange).toFixed(2)}%)</code>\n\nRetries <code>${retryCount + 1}/${this.config.maxSellRetries}</code>`, rawAccount.mint.toString());
+      }
+    } catch (error) {
+      logger.error("Error calculating profit", error);
+    }
+
+    logger.info(
+      {
+        dex: `https://dexscreener.com/solana/${rawAccount.mint.toString()}?maker=${this.config.wallet.publicKey}`,
+        mint: rawAccount.mint.toString(),
+        signature: result.signature,
+        url: `https://solscan.io/tx/${result.signature}?cluster=${NETWORK}`,
+      },
+      `Confirmed sell tx`,
+    );
+  }
+
+  private async closeAccount(accountId: PublicKey) {
+    const closeInstruction = createCloseAccountInstruction(accountId, this.config.wallet.publicKey, this.config.wallet.publicKey);
+    const latestBlockhash = await this.connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+      payerKey: this.config.wallet.publicKey,
+      recentBlockhash: latestBlockhash.blockhash,
+      instructions: [closeInstruction],
+    }).compileToV0Message();
+
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([this.config.wallet]);
+
+    await this.txExecutor.executeAndConfirm(transaction, this.config.wallet, latestBlockhash);
+  }
+
   private async swap(
     poolKeys: LiquidityPoolKeysV4,
     ataIn: PublicKey,
@@ -406,6 +416,7 @@ export class Bot {
     slippage: number,
     wallet: Keypair,
     direction: 'buy' | 'sell',
+    includeCloseAccountInstruction: boolean // Nuevo parámetro para controlar la inclusión de la instrucción de cerrar la cuenta
   ) {
     const slippagePercent = new Percent(slippage, 100);
     const poolInfo = await Liquidity.fetchInfo({
@@ -436,30 +447,34 @@ export class Bot {
       poolKeys.version,
     );
 
+    const instructions = [
+      ...(this.isWarp || this.isJito
+        ? []
+        : [
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
+          ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.unitLimit }),
+        ]),
+      ...(direction === 'buy'
+        ? [
+          createAssociatedTokenAccountIdempotentInstruction(
+            wallet.publicKey,
+            ataOut,
+            wallet.publicKey,
+            tokenOut.mint,
+          ),
+        ]
+        : []),
+      ...innerTransaction.instructions,
+    ];
+
+    if (direction === 'sell' && includeCloseAccountInstruction) {
+      instructions.push(createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey));
+    }
+
     const messageV0 = new TransactionMessage({
       payerKey: wallet.publicKey,
       recentBlockhash: latestBlockhash.blockhash,
-      instructions: [
-        ...(this.isWarp || this.isJito
-          ? []
-          : [
-            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
-            ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.unitLimit }),
-          ]),
-        ...(direction === 'buy'
-          ? [
-            createAssociatedTokenAccountIdempotentInstruction(
-              wallet.publicKey,
-              ataOut,
-              wallet.publicKey,
-              tokenOut.mint,
-            ),
-          ]
-          : []),
-        ...innerTransaction.instructions,
-        // Close the account if we are selling and not keeping 5% for moonshots
-        ...((direction === 'sell' && !KEEP_5_PERCENT_FOR_MOONSHOTS) ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []),
-      ],
+      instructions,
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
@@ -468,11 +483,7 @@ export class Bot {
     return this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
   }
 
-  private async filterMatch(poolKeys: LiquidityPoolKeysV4) {
-    if (this.config.filterCheckInterval === 0 || this.config.filterCheckDuration === 0) {
-      return true;
-    }
-
+  private async filterMatch(poolKeys: LiquidityPoolKeysV4): Promise<boolean> {
     const filters = new PoolFilters(this.connection, {
       quoteToken: this.config.quoteToken,
       minPoolSize: this.config.minPoolSize,
@@ -512,4 +523,4 @@ export class Bot {
 
     return false;
   }
-}
+} // Cerrar correctamente la clase Bot
