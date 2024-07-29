@@ -29,7 +29,6 @@ import {
   COMPUTE_UNIT_PRICE,
   CACHE_NEW_MARKETS,
   TAKE_PROFIT,
-  STOP_LOSS,
   BUY_SLIPPAGE,
   SELL_SLIPPAGE,
   PRICE_CHECK_DURATION,
@@ -46,7 +45,6 @@ import {
   CHECK_IF_BURNED,
   CHECK_IF_MUTABLE,
   CHECK_IF_SOCIALS,
-  TRAILING_STOP_LOSS,
   SKIP_SELLING_IF_LOST_MORE_THAN,
   MAX_LAG,
   CHECK_HOLDERS,
@@ -81,7 +79,7 @@ function printDetails(wallet: Keypair, quoteToken: Token, bot: Bot) {
                                         ..   :-===++++-     
                                 .-==+++++++- =+++++++++-    
             ..:::--===+=.=:     .+++++++++++:=+++++++++:    
-    .==+++++++++++++++=:+++:    .+++++++++++.=++++++++-.    
+    .==+++++++++++++++=:+++:    .+++++++++++:=++++++++-.    
     .-+++++++++++++++=:=++++-   .+++++++++=:.=+++++-::-.    
      -:+++++++++++++=:+++++++-  .++++++++-:- =+++++=-:      
       -:++++++=++++=:++++=++++= .++++++++++- =+++++:        
@@ -130,8 +128,6 @@ function printDetails(wallet: Keypair, quoteToken: Token, bot: Bot) {
   logger.info(`Price check interval: ${botConfig.priceCheckInterval} ms`);
   logger.info(`Price check duration: ${botConfig.priceCheckDuration} ms`);
   logger.info(`Take profit: ${botConfig.takeProfit}%`);
-  logger.info(`Stop loss: ${botConfig.stopLoss}%`);
-  logger.info(`Trailing stop loss: ${botConfig.trailingStopLoss}`);
   logger.info(`Skip selling if lost more than: ${botConfig.skipSellingIfLostMoreThan}%`);
 
   logger.info('- Snipe list -');
@@ -212,8 +208,6 @@ const runListener = async () => {
     unitLimit: COMPUTE_UNIT_LIMIT,
     unitPrice: COMPUTE_UNIT_PRICE,
     takeProfit: TAKE_PROFIT,
-    stopLoss: STOP_LOSS,
-    trailingStopLoss: TRAILING_STOP_LOSS,
     skipSellingIfLostMoreThan: SKIP_SELLING_IF_LOST_MORE_THAN,
     buySlippage: BUY_SLIPPAGE,
     sellSlippage: SELL_SLIPPAGE,
@@ -222,10 +216,10 @@ const runListener = async () => {
     filterCheckInterval: FILTER_CHECK_INTERVAL,
     filterCheckDuration: FILTER_CHECK_DURATION,
     consecutiveMatchCount: CONSECUTIVE_FILTER_MATCHES,
-    checkHolders:CHECK_HOLDERS,
-    checkTokenDistribution:CHECK_TOKEN_DISTRIBUTION,
-    checkAbnormalDistribution:CHECK_ABNORMAL_DISTRIBUTION,
-    telegramChatId:TELEGRAM_CHAT_ID,
+    checkHolders: CHECK_HOLDERS,
+    checkTokenDistribution: CHECK_TOKEN_DISTRIBUTION,
+    checkAbnormalDistribution: CHECK_ABNORMAL_DISTRIBUTION,
+    telegramChatId: TELEGRAM_CHAT_ID,
     telegramBotToken: TELEGRAM_BOT_TOKEN,
     blacklistRefreshInterval: BLACKLIST_REFRESH_INTERVAL,
     MACDLongPeriod: MACD_LONG_PERIOD,
@@ -238,7 +232,7 @@ const runListener = async () => {
     buySignalFractionPercentageTimeToWait: BUY_SIGNAL_FRACTION_TIME_TO_WAIT,
     buySignalLowVolumeThreshold: BUY_SIGNAL_LOW_VOLUME_THRESHOLD,
     useTelegram: USE_TELEGRAM,
-    useTechnicalAnalysis: USE_TA
+    useTechnicalAnalysis: USE_TA,
   };
 
   const bot = new Bot(connection, marketCache, poolCache, txExecutor, technicalAnalysisCache, botConfig);
@@ -277,8 +271,8 @@ const runListener = async () => {
 
     if (!exists && poolOpenTime > runTimestamp) {
       poolCache.save(updatedAccountInfo.accountId.toString(), poolState);
-      
-      if(MAX_LAG != 0 && lag > MAX_LAG){
+
+      if (MAX_LAG != 0 && lag > MAX_LAG) {
         logger.trace(`Lag too high: ${lag} sec`);
         return;
       } else {
@@ -302,4 +296,3 @@ const runListener = async () => {
 };
 
 runListener();
-
